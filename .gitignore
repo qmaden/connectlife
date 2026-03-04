@@ -5,3 +5,18 @@
 # Python
 venv/
 dist/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Environment files with credentials
+.env
+*.env
+
+# Log files
+*.log
+
+# Editor lock/temp files
+.#*
+*~
+*.swp

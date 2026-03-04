@@ -9,6 +9,8 @@ from .appliance import ConnectLifeAppliance
 
 _LOGGER = logging.getLogger(__name__)
 
+DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
 
 class LifeConnectError(Exception):
     pass
@@ -48,18 +50,31 @@ class ConnectLifeApi:
         self._expires: dt.datetime | None = None
         self._refresh_token: str | None = None
         self.appliances: Sequence[ConnectLifeAppliance] = []
+        self._session: aiohttp.ClientSession | None = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create a reusable client session."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=DEFAULT_TIMEOUT)
+        return self._session
+
+    async def close(self) -> None:
+        """Close the client session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     async def authenticate(self) -> bool:
         """Test if we can authenticate with the host."""
-        async with aiohttp.ClientSession() as session:
-            async with session.post(self.login_url, data={
-                "loginID": self._username,
-                "password": self._password,
-                "APIKey": self.api_key,
-            }) as response:
-                if response.status == 200:
-                    body = await self._json(response)
-                    return "UID" in body and "sessionInfo" in body and "cookieValue" in body["sessionInfo"]
+        session = await self._get_session()
+        async with session.post(self.login_url, data={
+            "loginID": self._username,
+            "password": self._password,
+            "APIKey": self.api_key,
+        }) as response:
+            if response.status == 200:
+                body = await self._json(response)
+                return "UID" in body and "sessionInfo" in body and "cookieValue" in body["sessionInfo"]
         return False
 
     async def login(self) -> None:
@@ -74,17 +89,17 @@ class ConnectLifeApi:
     async def get_appliances_json(self) -> Any:
         """Make a request and return the response as text."""
         await self._fetch_access_token()
-        async with aiohttp.ClientSession() as session:
-            async with session.get(self.appliances_url, headers={
-                "User-Agent": "connectlife-api-connector 2.1.4",
-                "X-Token": self._access_token
-            }) as response:
-                if response.status != 200:
-                    _LOGGER.debug(f"Response status code: {response.status}")
-                    _LOGGER.debug(response.headers)
-                    _LOGGER.debug(await response.text())
-                    raise LifeConnectError(f"Unexpected response: status={response.status}")
-                return await response.json()
+        session = await self._get_session()
+        async with session.get(self.appliances_url, headers={
+            "User-Agent": "connectlife-api-connector 2.1.4",
+            "X-Token": self._access_token
+        }) as response:
+            if response.status != 200:
+                _LOGGER.debug("Response status code: %d", response.status)
+                _LOGGER.debug(response.headers)
+                _LOGGER.debug(await response.text())
+                raise LifeConnectError(f"Unexpected response: status={response.status}")
+            return await response.json()
 
     async def update_appliance(self, puid: str, properties: dict[str, str]):
         data = {
@@ -93,125 +108,130 @@ class ConnectLifeApi:
         }
         _LOGGER.debug("Updating appliance with puid %s to %s", puid, json.dumps(properties))
         await self._fetch_access_token()
-        async with aiohttp.ClientSession() as session:
-            async with session.post(self.appliances_url, json=data, headers={
-                "User-Agent": "connectlife-api-connector 2.1.4",
-                "X-Token": self._access_token
-            }) as response:
-                result = await response.text()
-                _LOGGER.debug(result)
+        session = await self._get_session()
+        async with session.post(self.appliances_url, json=data, headers={
+            "User-Agent": "connectlife-api-connector 2.1.4",
+            "X-Token": self._access_token
+        }) as response:
+            if response.status != 200:
+                _LOGGER.debug("Response status code: %d", response.status)
+                _LOGGER.debug(await response.text())
+                raise LifeConnectError(f"Unexpected response from update: status={response.status}")
+            result = await response.text()
+            _LOGGER.debug("Update response: %s", result)
         _LOGGER.debug("Updated appliance with puid %s", puid)
 
     async def _fetch_access_token(self):
         if self._expires is None:
             await self._initial_access_token()
-        elif self._expires < dt.datetime.now():
+        elif self._expires < dt.datetime.now(dt.UTC):
             await self._refresh_access_token()
 
     async def _initial_access_token(self):
-        async with aiohttp.ClientSession() as session:
-            async with session.post(self.login_url, data={
-                "loginID": self._username,
-                "password": self._password,
-                "APIKey": self.api_key
-            }) as response:
-                if response.status != 200:
-                    _LOGGER.debug(f"Response status code: {response.status}")
-                    _LOGGER.debug(response.headers)
-                    _LOGGER.debug(await response.text())
-                    raise LifeConnectAuthError(f"Unexpected response from login: status={response.status}")
-                body = await self._json(response)
-                error_code = body["errorCode"] if "errorCode" in body else None
-                error_message = body["errorMessage"] if "errorMessage" in body else None
-                error_details = body["errorDetails"] if "errorDetails" in body else None
-                if error_code or error_message or error_details:
-                    raise LifeConnectAuthError(f"Failed to login. Code: {error_code} Message: '{error_message}' Details: '{error_details}'")
-                uid = self._require_auth_field(body, "UID")
-                session_info = self._require_auth_field(body, "sessionInfo")
-                if "cookieValue" not in session_info:
-                    _LOGGER.info(f"Missing 'sessionInfo.cookieValue' in response: {response}")
-                    raise LifeConnectAuthError(f"Missing 'sessionInfo.cookieValue' in response")
-                login_token = body["sessionInfo"]["cookieValue"]
+        session = await self._get_session()
 
-            async with session.post(self.jwt_url, data={
-                "APIKey": self.api_key,
-                "login_token":  login_token
-            }) as response:
-                if response.status != 200:
-                    _LOGGER.debug(f"Response status code: {response.status}")
-                    _LOGGER.debug(response.headers)
-                    _LOGGER.debug(await response.text())
-                    raise LifeConnectAuthError(f"Unexpected response from getJWT: status={response.status}")
-                body = await self._json(response)
-                if "id_token" not in body:
-                    raise LifeConnectAuthError(f"Missing 'id_token' in response")
-                id_token = body["id_token"]
+        async with session.post(self.login_url, data={
+            "loginID": self._username,
+            "password": self._password,
+            "APIKey": self.api_key
+        }) as response:
+            if response.status != 200:
+                _LOGGER.debug("Response status code: %d", response.status)
+                _LOGGER.debug(response.headers)
+                _LOGGER.debug(await response.text())
+                raise LifeConnectAuthError(f"Unexpected response from login: status={response.status}")
+            body = await self._json(response)
+            error_code = body.get("errorCode")
+            error_message = body.get("errorMessage")
+            error_details = body.get("errorDetails")
+            if error_code or error_message or error_details:
+                raise LifeConnectAuthError(f"Failed to login. Code: {error_code} Message: '{error_message}' Details: '{error_details}'")
+            uid = self._require_auth_field(body, "UID")
+            session_info = self._require_auth_field(body, "sessionInfo")
+            if "cookieValue" not in session_info:
+                _LOGGER.debug("Missing 'sessionInfo.cookieValue' in login response")
+                raise LifeConnectAuthError("Missing 'sessionInfo.cookieValue' in response")
+            login_token = body["sessionInfo"]["cookieValue"]
 
-            async with session.post(self.oauth2_authorize, json={
-                "client_id": self.client_id,
-                "redirect_uri": self.oauth2_redirect,
-                "idToken":  id_token,
-                "response_type": "code",
-                "thirdType": "CDC",
-                "thirdClientId": uid,
-            }) as response:
-                if response.status != 200:
-                    _LOGGER.debug(f"Response status code: {response.status}")
-                    _LOGGER.debug(response.headers)
-                    _LOGGER.debug(await response.text())
-                    raise LifeConnectAuthError(f"Unexpected response from authorize: status={response.status}")
-                body = await response.json()
-                code = self._require_auth_field(body, "code")
+        async with session.post(self.jwt_url, data={
+            "APIKey": self.api_key,
+            "login_token":  login_token
+        }) as response:
+            if response.status != 200:
+                _LOGGER.debug("Response status code: %d", response.status)
+                _LOGGER.debug(response.headers)
+                _LOGGER.debug(await response.text())
+                raise LifeConnectAuthError(f"Unexpected response from getJWT: status={response.status}")
+            body = await self._json(response)
+            if "id_token" not in body:
+                raise LifeConnectAuthError("Missing 'id_token' in response")
+            id_token = body["id_token"]
 
-            async with session.post(self.oauth2_token, data={
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "redirect_uri": self.oauth2_redirect,
-                "grant_type": "authorization_code",
-                "code": code,
-            }) as response:
-                if response.status != 200:
-                    _LOGGER.debug(f"Response status code: {response.status}")
-                    _LOGGER.debug(response.headers)
-                    _LOGGER.debug(await response.text())
-                    raise LifeConnectAuthError(f"Unexpected response from initial access token: status={response.status}")
-                body = await self._json(response)
-                self._access_token = self._require_auth_field(body, "access_token")
-                expires_in = self._require_auth_field(body, "expires_in")
-                # Renew 90 seconds before expiration
-                self._expires = dt.datetime.now() + dt.timedelta(0, expires_in - 90)
-                self._refresh_token = self._require_auth_field(body, "refresh_token")
+        async with session.post(self.oauth2_authorize, json={
+            "client_id": self.client_id,
+            "redirect_uri": self.oauth2_redirect,
+            "idToken":  id_token,
+            "response_type": "code",
+            "thirdType": "CDC",
+            "thirdClientId": uid,
+        }) as response:
+            if response.status != 200:
+                _LOGGER.debug("Response status code: %d", response.status)
+                _LOGGER.debug(response.headers)
+                _LOGGER.debug(await response.text())
+                raise LifeConnectAuthError(f"Unexpected response from authorize: status={response.status}")
+            body = await response.json()
+            code = self._require_auth_field(body, "code")
+
+        async with session.post(self.oauth2_token, data={
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "redirect_uri": self.oauth2_redirect,
+            "grant_type": "authorization_code",
+            "code": code,
+        }) as response:
+            if response.status != 200:
+                _LOGGER.debug("Response status code: %d", response.status)
+                _LOGGER.debug(response.headers)
+                _LOGGER.debug(await response.text())
+                raise LifeConnectAuthError(f"Unexpected response from initial access token: status={response.status}")
+            body = await self._json(response)
+            self._access_token = self._require_auth_field(body, "access_token")
+            expires_in = self._require_auth_field(body, "expires_in")
+            # Renew 90 seconds before expiration
+            self._expires = dt.datetime.now(dt.UTC) + dt.timedelta(0, expires_in - 90)
+            self._refresh_token = self._require_auth_field(body, "refresh_token")
 
     async def _refresh_access_token(self) -> None:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(self.oauth2_token, data={
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "redirect_uri": self.oauth2_redirect,
-                "grant_type": "refresh_token",
-                "refresh_token": self._refresh_token,
-            }) as response:
-                if response.status != 200:
-                    _LOGGER.debug(f"Response status code: {response.status}")
-                    _LOGGER.debug(response.headers)
-                    _LOGGER.debug(await response.text())
-                    raise LifeConnectAuthError(f"Unexpected response from refreshing access token: status={response.status}")
-                body = await response.json()
-                self._access_token = self._require_auth_field(body, "access_token")
-                expires_in = self._require_auth_field(body, "expires_in")
-                # Renew 90 seconds before expiration
-                self._expires = dt.datetime.now() + dt.timedelta(0, expires_in - 90)
+        session = await self._get_session()
+        async with session.post(self.oauth2_token, data={
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "redirect_uri": self.oauth2_redirect,
+            "grant_type": "refresh_token",
+            "refresh_token": self._refresh_token,
+        }) as response:
+            if response.status != 200:
+                _LOGGER.debug("Response status code: %d", response.status)
+                _LOGGER.debug(response.headers)
+                _LOGGER.debug(await response.text())
+                raise LifeConnectAuthError(f"Unexpected response from refreshing access token: status={response.status}")
+            body = await response.json()
+            self._access_token = self._require_auth_field(body, "access_token")
+            expires_in = self._require_auth_field(body, "expires_in")
+            # Renew 90 seconds before expiration
+            self._expires = dt.datetime.now(dt.UTC) + dt.timedelta(0, expires_in - 90)
 
     @staticmethod
     async def _json(response: aiohttp.ClientResponse) -> Any:
         # response may have wrong content-type, cannot use response.json()
         text = await response.text()
-        _LOGGER.debug(f"response: {text}")
+        _LOGGER.debug("Received response (length=%d)", len(text))
         return json.loads(text)
 
     @staticmethod
     def _require_auth_field(response: dict[str, Any], field: str):
         if field not in response:
-            _LOGGER.info(f"Missing '{field}' in response: {response}")
+            _LOGGER.debug("Missing '%s' in auth response", field)
             raise LifeConnectAuthError(f"Missing '{field}' in response")
         return response[field]

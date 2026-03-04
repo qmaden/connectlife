@@ -59,9 +59,9 @@ class ConnectLifeAppliance:
         self._room_name = data["roomName"]
         self._offline_state = data["offlineState"]
         self._seq = data["seq"]
-        self._bind_time = dt.datetime.fromtimestamp(data["bindTime"]/1000) if data["bindTime"] else None
-        self._use_time = dt.datetime.fromtimestamp(data["useTime"]/1000) if data["useTime"] else None
-        self._create_time = dt.datetime.fromtimestamp(data["createTime"]/1000) if data["createTime"] else None
+        self._bind_time = dt.datetime.fromtimestamp(data["bindTime"]/1000, tz=dt.UTC) if data["bindTime"] else None
+        self._use_time = dt.datetime.fromtimestamp(data["useTime"]/1000, tz=dt.UTC) if data["useTime"] else None
+        self._create_time = dt.datetime.fromtimestamp(data["createTime"]/1000, tz=dt.UTC) if data["createTime"] else None
         self._status_list = {k: convert(v) for k, v in data["statusList"].items()}
         self._device_type = DEVICE_TYPES[self._device_type_code] \
             if self._device_type_code in DEVICE_TYPES \
@@ -138,6 +138,50 @@ class ConnectLifeAppliance:
     @property
     def device_type(self) -> DeviceType:
         return self._device_type
+
+    async def update_properties(self, properties: dict[str, str | int]) -> None:
+        """Update device properties/settings.
+        
+        Args:
+            properties: Dictionary of property names and their new values.
+                       Property names should match those in the device's status_list.
+        
+        Example:
+            # Turn on power save mode
+            await appliance.update_properties({"Power_Save": "1"})
+            
+            # Change program and temperature
+            await appliance.update_properties({
+                "Selected_program_id_status": "5",
+                "Selected_program_set_temperature_status": "40"
+            })
+        """
+        # Convert all values to strings as the API expects string values
+        str_properties = {k: str(v) for k, v in properties.items()}
+        await self._api.update_appliance(self._puid, str_properties)
+
+    async def refresh_status(self) -> None:
+        """Refresh the appliance status from the API."""
+        appliances = await self._api.get_appliances_json()
+        for appliance_data in appliances:
+            if appliance_data.get("puid") == self._puid:
+                self._status_list = {k: convert(v) for k, v in appliance_data["statusList"].items()}
+                break
+
+    def get_property(self, property_name: str) -> str | int | float | dt.datetime | None:
+        """Get the current value of a specific property.
+        
+        Args:
+            property_name: The name of the property to retrieve
+            
+        Returns:
+            The current value of the property, or None if not found
+        """
+        return self._status_list.get(property_name)
+
+    def list_properties(self) -> list[str]:
+        """Get a list of all available property names for this device."""
+        return list(self._status_list.keys())
 
 
 def convert(value: str | float) -> float | int | str | dt.datetime:
