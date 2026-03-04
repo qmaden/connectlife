@@ -23,6 +23,7 @@ DEVICE_TYPES = {
     "003": DeviceType.WASHING_MACHINE,
     "004": DeviceType.TUMBLE_DRYER,
     "006": DeviceType.DEHUMIDIFIER,
+    "007": DeviceType.DEHUMIDIFIER,
     "009": DeviceType.AIRCONDITIONER,
     "010": DeviceType.HOOD,
     "013": DeviceType.OVEN,
