@@ -16,6 +16,18 @@ __pycache__/
 # Log files
 *.log
 
+# The controller is production code, even though a global ignore rule may
+# exclude directories named "capture". Keep runtime data and secrets ignored.
+!capture/
+capture/*
+!capture/__init__.py
+!capture/README.md
+!capture/switchbot_control.py
+!capture/switchbot_mqtt.py
+!capture/settings.example.json
+!capture/tests/
+!capture/tests/**
+
 # Editor lock/temp files
 .#*
 *~

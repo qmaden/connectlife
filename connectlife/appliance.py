@@ -163,11 +163,26 @@ class ConnectLifeAppliance:
 
     async def refresh_status(self) -> None:
         """Refresh the appliance status from the API."""
+        appliance_data = await self.fetch_status()
+        if appliance_data is not None:
+            self._update_status(appliance_data)
+
+    async def fetch_status(self) -> dict | None:
+        """Fetch this appliance without mutating the cached status."""
         appliances = await self._api.get_appliances_json()
         for appliance_data in appliances:
             if appliance_data.get("puid") == self._puid:
-                self._status_list = {k: convert(v) for k, v in appliance_data["statusList"].items()}
-                break
+                return appliance_data
+        return None
+
+    def _update_status(self, appliance_data: dict) -> None:
+        """Update mutable status fields from an appliance-list response."""
+        self._status_list = {
+            key: convert(value)
+            for key, value in appliance_data["statusList"].items()
+        }
+        self._offline_state = appliance_data.get("offlineState", self._offline_state)
+        self._seq = appliance_data.get("seq", self._seq)
 
     def get_property(self, property_name: str) -> str | int | float | dt.datetime | None:
         """Get the current value of a specific property.
