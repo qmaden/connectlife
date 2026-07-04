@@ -70,6 +70,11 @@ class ControllerStateTests(unittest.IsolatedAsyncioTestCase):
         controller._api_failure_count = 0
         controller._api_last_error = ""
         controller._loop = None
+        controller._sensor_offline = False
+        controller._sensor_offline_pending = False
+        controller._sensor_offline_generation = 0
+        controller._last_sensor_data_time = time.monotonic()
+        controller._start_time = time.monotonic() - controller.STARTUP_GRACE - 1
         self.notify = patch.object(
             controller,
             "tg_notify",
@@ -184,6 +189,30 @@ class ControllerStateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(queued)
         scheduled.assert_called_once()
+
+    async def test_short_offline_event_is_cancelled_without_alarm(self):
+        controller._loop = asyncio.get_running_loop()
+
+        with patch.object(controller, "SENSOR_OFFLINE_CONFIRM_SECONDS", 0.03):
+            controller.schedule_sensor_offline_confirmation()
+            await asyncio.sleep(0.01)
+            controller.mark_sensor_online()
+            await asyncio.sleep(0.04)
+
+        self.assertFalse(controller._sensor_offline)
+        self.assertFalse(controller._sensor_offline_pending)
+        controller.tg_notify.assert_not_awaited()
+
+    async def test_persistent_offline_event_is_confirmed(self):
+        controller._loop = asyncio.get_running_loop()
+
+        with patch.object(controller, "SENSOR_OFFLINE_CONFIRM_SECONDS", 0.01):
+            controller.schedule_sensor_offline_confirmation()
+            await asyncio.sleep(0.02)
+
+        self.assertTrue(controller._sensor_offline)
+        self.assertFalse(controller._sensor_offline_pending)
+        controller.tg_notify.assert_awaited_once()
 
 
 if __name__ == "__main__":

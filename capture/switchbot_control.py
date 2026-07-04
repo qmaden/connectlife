@@ -60,6 +60,9 @@ TELEGRAM_NOTIFY_SENSOR_ONLINE = (
     os.environ.get("TELEGRAM_NOTIFY_SENSOR_ONLINE", "0") == "1"
 )
 TG_COOLDOWN = int(os.environ.get("TELEGRAM_COOLDOWN_SECONDS", "1800"))
+SENSOR_OFFLINE_CONFIRM_SECONDS = int(
+    os.environ.get("SENSOR_OFFLINE_CONFIRM_SECONDS", "30")
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_FILE = Path(
@@ -142,6 +145,9 @@ _last_sensor: dict = {}
 _start_time = time.monotonic()
 _first_data_seen = False
 _sensor_offline = False
+_sensor_offline_pending = False
+_sensor_offline_generation = 0
+_last_sensor_data_time = 0.0
 STARTUP_GRACE = 15
 
 _last_state_refresh = 0.0
@@ -674,6 +680,86 @@ def evaluate_auto(data: dict) -> None:
             )
 
 
+# Sensor availability
+
+async def confirm_sensor_offline(generation: int) -> None:
+    global _sensor_offline, _sensor_offline_pending
+
+    await asyncio.sleep(SENSOR_OFFLINE_CONFIRM_SECONDS)
+    if (
+        not _sensor_offline_pending
+        or generation != _sensor_offline_generation
+    ):
+        return
+
+    _sensor_offline_pending = False
+    _sensor_offline = True
+    age = (
+        int(time.monotonic() - _last_sensor_data_time)
+        if _last_sensor_data_time
+        else None
+    )
+    age_text = f"{age}s ago" if age is not None else "unknown"
+    log.warning(
+        "Sensor OFFLINE confirmed after %ds; last data=%s",
+        SENSOR_OFFLINE_CONFIRM_SECONDS,
+        age_text,
+    )
+    await tg_notify(
+        "🚨 <b>ALARM: Outdoor sensor is OFFLINE</b>\n"
+        f"Offline status persisted for {SENSOR_OFFLINE_CONFIRM_SECONDS} seconds.\n"
+        f"Last BLE reading: {age_text}."
+    )
+
+
+def schedule_sensor_offline_confirmation() -> None:
+    global _sensor_offline_pending, _sensor_offline_generation
+
+    if _sensor_offline or _sensor_offline_pending:
+        return
+    if time.monotonic() - _start_time < STARTUP_GRACE:
+        log.info("Ignoring retained offline status during startup grace")
+        return
+    if not _loop or not _loop.is_running():
+        log.warning("Cannot confirm sensor offline status: event loop unavailable")
+        return
+
+    _sensor_offline_pending = True
+    _sensor_offline_generation += 1
+    generation = _sensor_offline_generation
+    log.info(
+        "Sensor offline status received; confirming for %ds",
+        SENSOR_OFFLINE_CONFIRM_SECONDS,
+    )
+    asyncio.run_coroutine_threadsafe(
+        confirm_sensor_offline(generation),
+        _loop,
+    )
+
+
+def mark_sensor_online() -> bool:
+    """Cancel a pending alarm and return whether a confirmed outage recovered."""
+    global _sensor_offline, _sensor_offline_pending
+    global _sensor_offline_generation, _last_sensor_data_time
+
+    _last_sensor_data_time = time.monotonic()
+    if _sensor_offline_pending:
+        _sensor_offline_generation += 1
+        _sensor_offline_pending = False
+        log.info("Sensor returned before offline confirmation; alarm cancelled")
+
+    if not _sensor_offline:
+        return False
+
+    _sensor_offline = False
+    log.info("Sensor is back ONLINE")
+    tg_fire(
+        "✅ <b>Sensor back ONLINE</b>" + sensor_summary(),
+        cooldown_key="sensor_online",
+    )
+    return True
+
+
 # Telegram callback and command handling
 
 async def handle_callback(query: dict):
@@ -825,7 +911,7 @@ async def telegram_poll():
 # MQTT
 
 def on_message(client, userdata, message):
-    global _first_data_seen, _mode, _sensor_offline
+    global _first_data_seen, _mode
 
     topic = message.topic
     payload = message.payload.decode("utf-8", errors="replace")
@@ -834,6 +920,7 @@ def on_message(client, userdata, message):
         try:
             data = json.loads(payload)
             _last_sensor.update(data)
+            mark_sensor_online()
             log.debug(
                 "Sensor: %s°C RH=%s%% Batt=%s%%",
                 data.get("temperature_c"),
@@ -853,25 +940,10 @@ def on_message(client, userdata, message):
             log.warning("Bad sensor JSON: %s", payload)
     elif topic == f"{SENSOR_TOPIC}/status":
         if payload == "offline":
-            if time.monotonic() - _start_time < STARTUP_GRACE:
-                log.info("Ignoring retained offline status during startup grace")
-                return
-            _sensor_offline = True
-            log.warning("Sensor is OFFLINE")
-            tg_fire(
-                "🚨 <b>ALARM: Outdoor sensor is OFFLINE</b>\n"
-                "No BLE data received for 60+ seconds.",
-                cooldown_key="sensor_offline",
-            )
+            schedule_sensor_offline_confirmation()
         else:
-            if _sensor_offline:
-                _sensor_offline = False
-                log.info("Sensor is back ONLINE")
-                tg_fire(
-                    "✅ <b>Sensor back ONLINE</b>" + sensor_summary(),
-                    cooldown_key="sensor_online",
-                )
-            elif TELEGRAM_NOTIFY_SENSOR_ONLINE:
+            recovered = mark_sensor_online()
+            if not recovered and TELEGRAM_NOTIFY_SENSOR_ONLINE:
                 tg_fire(
                     "✅ <b>Sensor is ONLINE</b>" + sensor_summary(),
                     cooldown_key="sensor_online",

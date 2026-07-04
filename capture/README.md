@@ -19,6 +19,9 @@ The default thresholds are ON at 60% and OFF at 55%. Telegram changes are
 written atomically to `capture/settings.json`. Override that path with
 `SWITCHBOT_SETTINGS_FILE`.
 
+An MQTT `offline` event must persist for 30 seconds before an alert is sent.
+Set `SENSOR_OFFLINE_CONFIRM_SECONDS` to change that confirmation window.
+
 ## Validation
 
 These checks do not start MQTT or issue appliance commands:
