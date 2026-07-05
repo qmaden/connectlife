@@ -318,6 +318,18 @@ def state_is_fresh(now: float | None = None) -> bool:
 def desired_state_is_fresh(turn_on: bool, now: float | None = None) -> bool:
     if not state_is_fresh(now) or _device_state != turn_on:
         return False
+    return cached_state_matches_desired(turn_on)
+
+
+def cached_state_matches_desired(turn_on: bool) -> bool:
+    """Return whether the last known state already matches an auto decision.
+
+    Auto control may use an old-but-known matching value because the background
+    reconciler continuously refreshes it. A failed reconciliation invalidates
+    the state to None, which re-enables safety enforcement.
+    """
+    if _device_state != turn_on:
+        return False
     if not turn_on:
         return True
     return bool(
@@ -562,6 +574,7 @@ async def set_device_power(turn_on: bool, trigger: str = "auto") -> bool:
 
         appliance = _appliances[TARGET_APPLIANCE_INDEX]
         action = "ON" if turn_on else "OFF"
+        previous_state = _device_state
 
         if desired_state_is_fresh(turn_on):
             log.debug("Skipping %s: fresh state already matches", action)
@@ -591,17 +604,25 @@ async def set_device_power(turn_on: bool, trigger: str = "auto") -> bool:
                 trigger,
                 properties,
             )
-            emoji = "✅" if turn_on else "⏹"
-            await tg_notify(
-                f"{emoji} <b>Dehumidifier turned {action}</b>\n"
-                f"Trigger: {trigger}"
-                + sensor_summary(),
-                cooldown_key=(
-                    None
-                    if trigger in ("Telegram manual", "MQTT command")
-                    else f"device_{action.lower()}_success"
-                ),
+            manual_command = trigger in ("Telegram manual", "MQTT command")
+            confirmed_transition = (
+                previous_state is not None
+                and previous_state != turn_on
             )
+            # An OFF write from an unknown/already-OFF state is safety
+            # enforcement, not evidence of a transition. Keep it silent.
+            if manual_command or turn_on or confirmed_transition:
+                emoji = "✅" if turn_on else "⏹"
+                await tg_notify(
+                    f"{emoji} <b>Dehumidifier turned {action}</b>\n"
+                    f"Trigger: {trigger}"
+                    + sensor_summary(),
+                    cooldown_key=(
+                        None
+                        if manual_command
+                        else f"device_{action.lower()}_success"
+                    ),
+                )
             return True
         except Exception as err:
             await record_api_failure(f"turn {action}", err)
@@ -637,7 +658,7 @@ def queue_auto_command(turn_on: bool, trigger: str) -> bool:
     if not _loop:
         return False
 
-    if desired_state_is_fresh(turn_on):
+    if cached_state_matches_desired(turn_on):
         return False
 
     now = time.monotonic()

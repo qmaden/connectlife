@@ -100,6 +100,7 @@ class ControllerStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([{"t_power": 0}], self.appliance.updates)
         self.assertFalse(controller._device_state)
         self.assertTrue(controller.state_is_fresh())
+        controller.tg_notify.assert_not_awaited()
 
     async def test_failed_on_then_recovered_off_does_not_need_status(self):
         self.appliance.update_failures = 1
@@ -149,6 +150,16 @@ class ControllerStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(controller._device_state)
         self.assertTrue(controller.state_is_fresh())
 
+    async def test_confirmed_on_to_off_transition_notifies(self):
+        controller._device_state = True
+        controller._last_state_refresh = time.monotonic()
+
+        changed = await controller.set_device_power(False, "humidity=50%")
+
+        self.assertTrue(changed)
+        self.assertFalse(controller._device_state)
+        controller.tg_notify.assert_awaited_once()
+
     async def test_slow_refresh_does_not_block_or_overwrite_off_command(self):
         self.appliance.refreshed_power = 1
         self.appliance.refresh_started = asyncio.Event()
@@ -170,11 +181,29 @@ class ControllerStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(controller._device_state)
         self.assertEqual([{"t_power": 0}], self.appliance.updates)
 
-    def test_queue_schedules_when_matching_state_is_stale(self):
+    def test_queue_suppresses_matching_state_while_reconcile_is_pending(self):
         controller._loop = object()
         controller._last_state_refresh = (
             time.monotonic() - controller.STATE_REFRESH_INTERVAL - 1
         )
+
+        def close_coroutine(coroutine, loop):
+            coroutine.close()
+            return None
+
+        with patch.object(
+            controller.asyncio,
+            "run_coroutine_threadsafe",
+            side_effect=close_coroutine,
+        ) as scheduled:
+            queued = controller.queue_auto_command(False, "humidity=50%")
+
+        self.assertFalse(queued)
+        scheduled.assert_not_called()
+
+    def test_queue_schedules_after_refresh_failure_invalidates_state(self):
+        controller._loop = object()
+        controller._device_state = None
 
         def close_coroutine(coroutine, loop):
             coroutine.close()
