@@ -63,3 +63,18 @@ class TestAppliance(unittest.TestCase):
         self.assertEqual(1, appliance.status_list["t_power"])
         self.assertEqual(1, appliance.offline_state)
         self.assertEqual(2, appliance.seq)
+
+
+class MissingStatusApi:
+    async def get_appliances_json(self):
+        return [{"puid": "target"}]
+
+
+class ApplianceRefreshTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_status_is_not_treated_as_a_fresh_observation(self):
+        appliance = object.__new__(ConnectLifeAppliance)
+        appliance._api = MissingStatusApi()
+        appliance._puid = "target"
+
+        with self.assertRaisesRegex(RuntimeError, "has no statusList"):
+            await appliance.fetch_status()

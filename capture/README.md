@@ -15,6 +15,11 @@ TELEGRAM_TOKEN=...
 TELEGRAM_CHAT_ID=...
 ```
 
+Accounts with more than one ConnectLife appliance must also set
+`CONNECTLIFE_APPLIANCE_PUID` to the stable PUID of the appliance being
+controlled. The controller refuses automatic writes when multiple appliances
+exist and no stable target is configured.
+
 The default thresholds are ON at 60% and OFF at 55%. Telegram changes are
 written atomically to `capture/settings.json`. Override that path with
 `SWITCHBOT_SETTINGS_FILE`.

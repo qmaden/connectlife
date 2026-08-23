@@ -172,6 +172,10 @@ class ConnectLifeAppliance:
         appliances = await self._api.get_appliances_json()
         for appliance_data in appliances:
             if appliance_data.get("puid") == self._puid:
+                if not isinstance(appliance_data.get("statusList"), dict):
+                    raise RuntimeError(
+                        "Target appliance snapshot has no statusList"
+                    )
                 return appliance_data
         return None
 
@@ -200,11 +204,17 @@ class ConnectLifeAppliance:
         return list(self._status_list.keys())
 
 
-def convert(value: str | float) -> float | int | str | dt.datetime:
-    if isinstance(value, float):
+def convert(
+    value: str | float | int | dt.datetime,
+) -> float | int | str | dt.datetime:
+    if isinstance(value, (int, float, dt.datetime)):
         return value
     try:
         return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
     except ValueError:
         pass
     try:

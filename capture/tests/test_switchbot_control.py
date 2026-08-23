@@ -12,6 +12,7 @@ controller.api_log.disabled = True
 
 class FakeAppliance:
     def __init__(self):
+        self.puid = "target-puid"
         self.device_nickname = "Dehumidifier"
         self.status_list = {
             "t_power": 0,
@@ -242,6 +243,31 @@ class ControllerStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(controller._sensor_offline)
         self.assertFalse(controller._sensor_offline_pending)
         controller.tg_notify.assert_awaited_once()
+
+    def test_multiple_appliances_require_stable_puid(self):
+        other = FakeAppliance()
+        other.puid = "other-puid"
+
+        with (
+            patch.object(controller, "TARGET_APPLIANCE_PUID", ""),
+            self.assertRaisesRegex(RuntimeError, "Multiple ConnectLife appliances"),
+        ):
+            controller.select_target_appliance([other, self.appliance])
+
+    def test_configured_puid_selects_target_regardless_of_order(self):
+        other = FakeAppliance()
+        other.puid = "other-puid"
+
+        with patch.object(
+            controller,
+            "TARGET_APPLIANCE_PUID",
+            self.appliance.puid,
+        ):
+            selected = controller.select_target_appliance(
+                [other, self.appliance]
+            )
+
+        self.assertIs(self.appliance, selected)
 
 
 if __name__ == "__main__":

@@ -47,7 +47,7 @@ DEVICE_FAN_SPEED_KEY = "t_fan_speed"
 DEVICE_FAN_SPEED_HIGH = 2
 DEVICE_TARGET_HUMIDITY_KEY = "t_humidity"
 DEVICE_TARGET_HUMIDITY = 30
-TARGET_APPLIANCE_INDEX = int(os.environ.get("CONNECTLIFE_APPLIANCE_INDEX", "0"))
+TARGET_APPLIANCE_PUID = os.environ.get("CONNECTLIFE_APPLIANCE_PUID", "").strip()
 
 STATE_REFRESH_INTERVAL = int(
     os.environ.get("CONNECTLIFE_STATE_REFRESH_INTERVAL", "60")
@@ -332,9 +332,13 @@ def cached_state_matches_desired(turn_on: bool) -> bool:
         return False
     if not turn_on:
         return True
+    try:
+        appliance = select_target_appliance(_appliances)
+    except RuntimeError:
+        return False
     return bool(
-        _appliances
-        and current_on_settings_match(_appliances[TARGET_APPLIANCE_INDEX])
+        appliance
+        and current_on_settings_match(appliance)
     )
 
 
@@ -401,6 +405,30 @@ def is_power_on(value) -> bool:
         "running",
         "RUNNING",
         True,
+    )
+
+
+def select_target_appliance(appliances):
+    """Select one appliance without relying on unstable list ordering."""
+    if not appliances:
+        raise RuntimeError("No appliances returned for this account")
+    if TARGET_APPLIANCE_PUID:
+        matches = [
+            appliance
+            for appliance in appliances
+            if appliance.puid == TARGET_APPLIANCE_PUID
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Configured CONNECTLIFE_APPLIANCE_PUID did not match exactly "
+                "one appliance"
+            )
+        return matches[0]
+    if len(appliances) == 1:
+        return appliances[0]
+    raise RuntimeError(
+        "Multiple ConnectLife appliances found; configure "
+        "CONNECTLIFE_APPLIANCE_PUID before automatic control"
     )
 
 
@@ -485,14 +513,8 @@ async def connectlife_login() -> bool:
         try:
             await _cl_api.login()
             appliances = await _cl_api.get_appliances()
-            if not appliances:
-                raise RuntimeError("No appliances returned for this account")
-            if TARGET_APPLIANCE_INDEX >= len(appliances):
-                raise IndexError(
-                    f"Appliance index {TARGET_APPLIANCE_INDEX} is unavailable"
-                )
+            appliance = select_target_appliance(appliances)
             _appliances = appliances
-            appliance = appliances[TARGET_APPLIANCE_INDEX]
             current_power = appliance.status_list.get(DEVICE_POWER_KEY)
             if current_power is None:
                 raise RuntimeError(f"Appliance has no {DEVICE_POWER_KEY} property")
@@ -518,7 +540,7 @@ async def refresh_device_state(force: bool = False):
     if not force and state_is_fresh():
         return _device_state
 
-    appliance = _appliances[TARGET_APPLIANCE_INDEX]
+    appliance = select_target_appliance(_appliances)
     request_started = time.monotonic()
     try:
         appliance_data = await appliance.fetch_status()
@@ -572,7 +594,7 @@ async def set_device_power(turn_on: bool, trigger: str = "auto") -> bool:
             if not await connectlife_login():
                 return False
 
-        appliance = _appliances[TARGET_APPLIANCE_INDEX]
+        appliance = select_target_appliance(_appliances)
         action = "ON" if turn_on else "OFF"
         previous_state = _device_state
 
