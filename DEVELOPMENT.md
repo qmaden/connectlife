@@ -15,6 +15,10 @@ The `controller` extra installs `paho-mqtt` and `bleak`, which the production
 BLE/MQTT programs and the full test suite import. A library-only install
 (`python -m pip install -e .`) omits them.
 
+With [uv](https://docs.astral.sh/uv/), `uv sync --extra controller` creates the
+same environment (plus the `dev` group used by the dump tooling), and
+`uv run --extra controller python -m unittest discover -v` runs the suite.
+
 ## Validation
 
 Run all checks from the repository root:
@@ -41,7 +45,7 @@ writable.
 
 ```bash
 cd dumps
-python -m test_server
+python -m connectlife.test_server
 ```
 
 To use the test server, provide its URL to the client:

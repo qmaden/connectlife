@@ -11,8 +11,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - name: Install dependencies
-        run: python -m pip install -e ".[controller]"
+          python-version-file: ".python-version"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.23"
       - name: Run tests
-        run: python -m unittest discover -v
+        run: uv run --extra controller python -m unittest discover -v

@@ -31,15 +31,14 @@ package:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e .
-python -m pip install paho-mqtt bleak
+python -m pip install -e ".[controller]"
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -v
 ```
 
 See [`DEVELOPMENT.md`](DEVELOPMENT.md) for the local test server and full checks.
-The `capture/` daemons additionally require `paho-mqtt` and `bleak`; those
-runtime dependencies are currently managed on the deployment host rather than
-declared by the library package.
+The `capture/` daemons additionally require `paho-mqtt` and `bleak`, declared
+as the `controller` extra. A library-only install (`pip install -e .`) omits
+them.
 
 Do not pass real passwords on a command line or run live appliance writes as a
 test. Keep credentials in an owner-only environment file and use mocks or the
