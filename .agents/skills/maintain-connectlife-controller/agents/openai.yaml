@@ -1,0 +1,4 @@
+interface:
+  display_name: "Maintain ConnectLife Controller"
+  short_description: "Safely change and operate the ConnectLife controller"
+  default_prompt: "Use $maintain-connectlife-controller to diagnose and safely update the ConnectLife controller."

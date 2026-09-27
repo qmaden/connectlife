@@ -17,7 +17,15 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "aiohttp>=3.9.5",
+    "aiohttp>=3.11.0",
+    "cryptography>=42.0.0",
+]
+
+[project.optional-dependencies]
+# Runtime dependencies of the capture/ BLE scanner and MQTT controller.
+controller = [
+    "paho-mqtt>=2.0",
+    "bleak>=0.22",
 ]
 
 [project.urls]

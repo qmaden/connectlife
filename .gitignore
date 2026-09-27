@@ -5,3 +5,32 @@
 # Python
 venv/
 dist/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Environment files with credentials
+.env
+*.env
+
+# Log files
+*.log
+
+# The controller is production code, even though a global ignore rule may
+# exclude directories named "capture". Keep runtime data and secrets ignored.
+!capture/
+capture/*
+!capture/__init__.py
+!capture/README.md
+!capture/switchbot_control.py
+!capture/switchbot_mqtt.py
+!capture/settings.example.json
+!capture/restart_services.sh
+!capture/tests/
+!capture/tests/**
+capture/tests/__pycache__/
+
+# Editor lock/temp files
+.#*
+*~
+*.swp

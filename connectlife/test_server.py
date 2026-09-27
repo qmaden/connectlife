@@ -98,8 +98,8 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='ConnectLife API test server')
     parser.add_argument('-p', '--port', type=int, default=8080, help='Port on which to serve the web app')
-    parser.add_argument('-f', '--failure_rate', type=int, default=0, help='Failure rate in % for get appliances')
-    parser.add_argument('-t', '--timeout_rate', type=int, default=0, help='Timeout rate in % for get appliances')
+    parser.add_argument('-f', '--failure_rate', type=int, default=0, help='Failure rate in %% for get appliances')
+    parser.add_argument('-t', '--timeout_rate', type=int, default=0, help='Timeout rate in %% for get appliances')
     args = parser.parse_args()
     failure_rate = args.failure_rate
     timeout_rate = args.timeout_rate
