@@ -63,6 +63,21 @@ TG_COOLDOWN = int(os.environ.get("TELEGRAM_COOLDOWN_SECONDS", "1800"))
 SENSOR_OFFLINE_CONFIRM_SECONDS = int(
     os.environ.get("SENSOR_OFFLINE_CONFIRM_SECONDS", "30")
 )
+# Readings older than this (e.g. a retained MQTT message left by a dead
+# scanner) are displayed but never drive control or availability decisions.
+SENSOR_MAX_AGE_SECONDS = int(os.environ.get("SENSOR_MAX_AGE_SECONDS", "180"))
+# Turn the dehumidifier OFF after a confirmed sensor outage lasts this long in
+# auto mode. 0 disables the failsafe and keeps the last commanded state.
+SENSOR_OFFLINE_FAILSAFE_SECONDS = int(
+    os.environ.get("SENSOR_OFFLINE_FAILSAFE_SECONDS", "0")
+)
+# The cloud can return the pre-command state for a short time after a write.
+# Reads contradicting a successful command inside this window are ignored.
+COMMAND_SETTLE_SECONDS = int(
+    os.environ.get("CONNECTLIFE_COMMAND_SETTLE_SECONDS", "30")
+)
+TELEGRAM_POLL_BASE_BACKOFF = 5
+TELEGRAM_POLL_MAX_BACKOFF = 60
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_FILE = Path(
@@ -75,20 +90,27 @@ LOG_FILE = BASE_DIR / "switchbot_control.log"
 
 log = logging.getLogger("switchbot-control")
 if not log.handlers:
-    file_handler = logging.handlers.RotatingFileHandler(
-        LOG_FILE,
-        maxBytes=5 * 1024 * 1024,
-        backupCount=3,
-    )
-    stream_handler = logging.StreamHandler()
+    # Under systemd, stdout already goes to the persistent journal with
+    # timestamps. Writing a rotating file as well would store every line twice.
+    under_journal = bool(os.environ.get("JOURNAL_STREAM"))
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if not under_journal:
+        handlers.append(
+            logging.handlers.RotatingFileHandler(
+                LOG_FILE,
+                maxBytes=5 * 1024 * 1024,
+                backupCount=3,
+            )
+        )
     formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s",
+        "[%(levelname)s] %(message)s"
+        if under_journal
+        else "%(asctime)s [%(levelname)s] %(message)s",
         "%Y-%m-%d %H:%M:%S",
     )
-    file_handler.setFormatter(formatter)
-    stream_handler.setFormatter(formatter)
-    log.addHandler(file_handler)
-    log.addHandler(stream_handler)
+    for handler in handlers:
+        handler.setFormatter(formatter)
+        log.addHandler(handler)
 log.setLevel(logging.INFO)
 log.propagate = False
 
@@ -101,9 +123,11 @@ api_log.propagate = False
 
 # Persistent settings
 
+VALID_MODES = ("auto", "manual")
 DEFAULT_SETTINGS = {
     "humidity_on_above": 60,
     "humidity_off_below": 55,
+    "mode": "auto",
 }
 
 
@@ -115,6 +139,8 @@ def load_settings() -> dict:
             settings = {**DEFAULT_SETTINGS, **data}
             if settings["humidity_off_below"] >= settings["humidity_on_above"]:
                 raise ValueError("OFF threshold must be below ON threshold")
+            if settings["mode"] not in VALID_MODES:
+                raise ValueError(f"mode must be one of {VALID_MODES}")
             return settings
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as err:
             log.error("Invalid settings file %s: %s", SETTINGS_FILE, err)
@@ -136,7 +162,7 @@ _settings = load_settings()
 
 # Runtime state
 
-_mode = "auto"
+_mode = _settings["mode"]
 _device_state: bool | None = None
 _cl_api: ConnectLifeApi | None = None
 _appliances = None
@@ -151,6 +177,8 @@ _last_sensor_data_time = 0.0
 STARTUP_GRACE = 15
 
 _last_state_refresh = 0.0
+_last_command_time = 0.0
+_last_command_state: bool | None = None
 _command_lock = asyncio.Lock()
 _connect_lock = asyncio.Lock()
 _last_auto_command_attempt = {
@@ -162,6 +190,25 @@ _api_outage_active = False
 _api_failure_count = 0
 _api_last_error = ""
 _tg_last_sent: dict[str, float] = {}
+_tg_session: aiohttp.ClientSession | None = None
+_background_tasks: set[asyncio.Task] = set()
+
+
+def spawn(coroutine) -> asyncio.Task:
+    """Run a coroutine on the current loop and keep a reference until done."""
+    task = asyncio.get_running_loop().create_task(coroutine)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_task_done)
+    return task
+
+
+def _background_task_done(task: asyncio.Task) -> None:
+    _background_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        log.error(
+            "Background task failed: %s",
+            format_exception(task.exception()),
+        )
 
 
 # Telegram helpers
@@ -178,14 +225,61 @@ def format_exception(err: BaseException) -> str:
     return f"{type(err).__name__}: {detail}"
 
 
+class TelegramApiError(Exception):
+    """The Bot API answered, but with ok=false."""
+
+    def __init__(self, method: str, body):
+        body = body if isinstance(body, dict) else {}
+        parameters = body.get("parameters")
+        self.description = str(body.get("description") or "no description")
+        self.retry_after = (
+            parameters.get("retry_after")
+            if isinstance(parameters, dict)
+            else None
+        )
+        super().__init__(
+            f"{method} returned error {body.get('error_code')}: "
+            f"{self.description}"
+        )
+
+
+async def _tg_request(method: str, **kwargs) -> dict:
+    """Call the Bot API over one shared session; raise on any failure."""
+    global _tg_session
+    if _tg_session is None or _tg_session.closed:
+        _tg_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=35, connect=10)
+        )
+    async with _tg_session.post(f"{TG_API}/{method}", json=kwargs) as response:
+        body = await response.json(content_type=None)
+    if not isinstance(body, dict) or not body.get("ok"):
+        raise TelegramApiError(method, body)
+    return body
+
+
+async def close_telegram_session() -> None:
+    global _tg_session
+    if _tg_session is not None and not _tg_session.closed:
+        await _tg_session.close()
+    _tg_session = None
+
+
 async def _tg(method: str, **kwargs):
     if not TELEGRAM_TOKEN:
         return {}
     try:
-        timeout = aiohttp.ClientTimeout(total=35, connect=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{TG_API}/{method}", json=kwargs) as response:
-                return await response.json()
+        return await _tg_request(method, **kwargs)
+    except asyncio.CancelledError:
+        raise
+    except TelegramApiError as err:
+        # Re-rendering an unchanged menu (e.g. Refresh) is expected.
+        level = (
+            logging.DEBUG
+            if "message is not modified" in err.description
+            else logging.WARNING
+        )
+        log.log(level, "Telegram %s failed: %s", method, format_exception(err))
+        return {}
     except Exception as err:
         log.warning("Telegram %s failed: %s", method, format_exception(err))
         return {}
@@ -236,10 +330,7 @@ async def tg_notify(text: str, cooldown_key: str | None = None):
 
 def tg_fire(text: str, cooldown_key: str | None = None):
     if _loop and _loop.is_running():
-        asyncio.run_coroutine_threadsafe(
-            tg_notify(text, cooldown_key),
-            _loop,
-        )
+        spawn(tg_notify(text, cooldown_key))
 
 
 # Menu builders
@@ -306,6 +397,21 @@ def state_age(now: float | None = None) -> float | None:
     return (now if now is not None else time.monotonic()) - _last_state_refresh
 
 
+def sensor_reading_age(data: dict, now: float | None = None) -> float | None:
+    """Return the age of a scanner reading, or None if it has no timestamp."""
+    timestamp = data.get("timestamp")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+        return None
+    return (now if now is not None else time.time()) - timestamp
+
+
+def sensor_reading_is_fresh(data: dict, now: float | None = None) -> bool:
+    if not data:
+        return False
+    age = sensor_reading_age(data, now)
+    return age is None or age <= SENSOR_MAX_AGE_SECONDS
+
+
 def state_is_fresh(now: float | None = None) -> bool:
     age = state_age(now)
     return (
@@ -355,6 +461,13 @@ def status_text() -> str:
     state_detail = "unverified" if age is None else f"checked {int(age)}s ago"
     if not data:
         return "⏳ No sensor data received yet."
+    reading_age = sensor_reading_age(data)
+    reading_detail = ""
+    if reading_age is not None:
+        reading_detail = f"🕒 Reading age: {max(0, int(reading_age))}s"
+        if not sensor_reading_is_fresh(data):
+            reading_detail += " (stale, ignored for control)"
+        reading_detail += "\n"
     return (
         f"<b>Outdoor Sensor</b>\n"
         f"🌡 Temp: {data.get('temperature_c')}°C / "
@@ -364,13 +477,20 @@ def status_text() -> str:
         f"📊 Abs. humidity: {data.get('absolute_humidity')} g/m³\n"
         f"📉 VPD: {data.get('vpd')} kPa\n"
         f"🔋 Battery: {data.get('battery')}%\n"
-        f"📶 RSSI: {data.get('rssi')} dBm\n\n"
+        f"📶 RSSI: {data.get('rssi')} dBm\n"
+        f"{reading_detail}\n"
         f"<b>Dehumidifier:</b> {device} ({state_detail})\n"
         f"<b>API:</b> {'degraded ❌' if _api_outage_active else 'available ✅'}\n"
         f"<b>Mode:</b> {_mode}\n"
         f"<b>Thresholds:</b> ON ≥{_settings['humidity_on_above']}%  "
         f"OFF ≤{_settings['humidity_off_below']}%"
     )
+
+
+def control_text(result: str = "") -> str:
+    label = "🤖 Auto" if _mode == "auto" else "🖐 Manual"
+    text = f"🎛 <b>Control</b>\nCurrent mode: <b>{label}</b>"
+    return f"{text}\n\n{result}" if result else text
 
 
 def settings_text() -> str:
@@ -488,6 +608,10 @@ async def record_api_recovery(operation: str) -> None:
     _api_outage_active = False
     _api_failure_count = 0
     _api_last_error = ""
+    # Commands throttled during the outage should go out on the next reading
+    # instead of waiting for the rest of AUTO_COMMAND_RETRY_INTERVAL.
+    for turn_on in _last_auto_command_attempt:
+        _last_auto_command_attempt[turn_on] = 0.0
     log.info(
         "ConnectLife API recovered during %s after %d failures",
         operation,
@@ -551,11 +675,26 @@ async def refresh_device_state(force: bool = False):
             # is newer, so an older GET response must not overwrite it.
             log.debug("Discarding state refresh superseded by a command")
             return _device_state
-        appliance._update_status(appliance_data)
-        current_power = appliance.status_list.get(DEVICE_POWER_KEY)
+        current_power = appliance_data["statusList"].get(DEVICE_POWER_KEY)
         if current_power is None:
             raise RuntimeError(f"Appliance has no {DEVICE_POWER_KEY} property")
         actual_state = is_power_on(current_power)
+        since_command = request_started - _last_command_time
+        if (
+            _last_command_state is not None
+            and actual_state != _last_command_state
+            and since_command < COMMAND_SETTLE_SECONDS
+        ):
+            # The cloud can briefly serve the pre-command snapshot. Keep the
+            # command's observation; the next reconciliation re-checks it.
+            log.info(
+                "Ignoring state refresh that contradicts the %s command "
+                "sent %.0fs earlier",
+                "ON" if _last_command_state else "OFF",
+                since_command,
+            )
+            return _device_state
+        appliance._update_status(appliance_data)
         previous_state = _device_state
         _device_state = actual_state
         _last_state_refresh = time.monotonic()
@@ -585,9 +724,18 @@ async def refresh_for_status() -> None:
         await refresh_device_state(force=True)
 
 
-async def set_device_power(turn_on: bool, trigger: str = "auto") -> bool:
-    """Write the desired state directly, then update the local observation."""
+async def set_device_power(
+    turn_on: bool,
+    trigger: str = "auto",
+    force: bool = False,
+) -> bool:
+    """Write the desired state directly, then update the local observation.
+
+    Returns True only after a successful write. Manual commands pass
+    ``force`` so an explicit user request is never skipped on cached state.
+    """
     global _device_state, _last_state_refresh
+    global _last_command_time, _last_command_state
 
     async with _command_lock:
         if not _cl_api or not _appliances:
@@ -598,7 +746,7 @@ async def set_device_power(turn_on: bool, trigger: str = "auto") -> bool:
         action = "ON" if turn_on else "OFF"
         previous_state = _device_state
 
-        if desired_state_is_fresh(turn_on):
+        if not force and desired_state_is_fresh(turn_on):
             log.debug("Skipping %s: fresh state already matches", action)
             return False
 
@@ -618,6 +766,8 @@ async def set_device_power(turn_on: bool, trigger: str = "auto") -> bool:
             appliance.status_list.update(properties)
             _device_state = turn_on
             _last_state_refresh = time.monotonic()
+            _last_command_time = _last_state_refresh
+            _last_command_state = turn_on
             await record_api_recovery(f"turn {action}")
             log.info(
                 "Device '%s' turned %s (%s); properties=%s",
@@ -689,10 +839,7 @@ def queue_auto_command(turn_on: bool, trigger: str) -> bool:
         return False
 
     _last_auto_command_attempt[turn_on] = now
-    asyncio.run_coroutine_threadsafe(
-        set_device_power(turn_on, trigger),
-        _loop,
-    )
+    spawn(set_device_power(turn_on, trigger))
     return True
 
 
@@ -723,6 +870,24 @@ def evaluate_auto(data: dict) -> None:
             )
 
 
+def set_mode(mode: str, source: str) -> bool:
+    """Change and persist the control mode; return whether it changed."""
+    global _mode
+    if mode not in VALID_MODES or mode == _mode:
+        return False
+    _mode = mode
+    _settings["mode"] = mode
+    try:
+        save_settings(_settings)
+    except OSError as err:
+        log.error("Could not persist mode %s: %s", mode, err)
+    log.info("%s mode changed to %s", source, mode)
+    if mode == "auto" and sensor_reading_is_fresh(_last_sensor):
+        # Apply the thresholds now instead of waiting for the next reading.
+        evaluate_auto(_last_sensor)
+    return True
+
+
 # Sensor availability
 
 async def confirm_sensor_offline(generation: int) -> None:
@@ -748,11 +913,33 @@ async def confirm_sensor_offline(generation: int) -> None:
         SENSOR_OFFLINE_CONFIRM_SECONDS,
         age_text,
     )
+    failsafe_text = (
+        f"\nFailsafe: dehumidifier turns OFF after "
+        f"{SENSOR_OFFLINE_FAILSAFE_SECONDS}s more offline in auto mode."
+        if SENSOR_OFFLINE_FAILSAFE_SECONDS > 0
+        else ""
+    )
     await tg_notify(
         "🚨 <b>ALARM: Outdoor sensor is OFFLINE</b>\n"
         f"Offline status persisted for {SENSOR_OFFLINE_CONFIRM_SECONDS} seconds.\n"
         f"Last BLE reading: {age_text}."
+        + failsafe_text
     )
+
+    if SENSOR_OFFLINE_FAILSAFE_SECONDS <= 0:
+        return
+    await asyncio.sleep(SENSOR_OFFLINE_FAILSAFE_SECONDS)
+    if (
+        not _sensor_offline
+        or generation != _sensor_offline_generation
+        or _mode != "auto"
+    ):
+        return
+    log.warning(
+        "Sensor offline for %ds after confirmation; applying OFF failsafe",
+        SENSOR_OFFLINE_FAILSAFE_SECONDS,
+    )
+    await set_device_power(False, "sensor offline failsafe")
 
 
 def schedule_sensor_offline_confirmation() -> None:
@@ -774,10 +961,7 @@ def schedule_sensor_offline_confirmation() -> None:
         "Sensor offline status received; confirming for %ds",
         SENSOR_OFFLINE_CONFIRM_SECONDS,
     )
-    asyncio.run_coroutine_threadsafe(
-        confirm_sensor_offline(generation),
-        _loop,
-    )
+    spawn(confirm_sensor_offline(generation))
 
 
 def mark_sensor_online() -> bool:
@@ -795,6 +979,8 @@ def mark_sensor_online() -> bool:
         return False
 
     _sensor_offline = False
+    # Invalidate the finished outage's pending failsafe.
+    _sensor_offline_generation += 1
     log.info("Sensor is back ONLINE")
     tg_fire(
         "✅ <b>Sensor back ONLINE</b>" + sensor_summary(),
@@ -805,12 +991,32 @@ def mark_sensor_online() -> bool:
 
 # Telegram callback and command handling
 
+async def handle_manual_power(query_id: str, chat_id, message_id: int, turn_on: bool):
+    action = "ON" if turn_on else "OFF"
+    if _mode != "manual":
+        await tg_answer(query_id, "Switch to Manual mode first.")
+        await tg_edit(chat_id, message_id, control_text(), control_kb())
+        return
+
+    await tg_answer(query_id, f"Sending {action} command...")
+    if await set_device_power(turn_on, "Telegram manual", force=True):
+        result = f"✅ {action} command confirmed by ConnectLife."
+    else:
+        detail = f"\nError: {_api_last_error}" if _api_last_error else ""
+        result = f"❌ {action} command failed; device state is unknown.{detail}"
+    await tg_edit(chat_id, message_id, control_text(result), control_kb())
+
+
 async def handle_callback(query: dict):
-    global _mode, _settings
     data = query.get("data", "")
     query_id = query["id"]
     chat_id = query["message"]["chat"]["id"]
     message_id = query["message"]["message_id"]
+
+    if data in ("ctrl:on", "ctrl:off"):
+        # Answer exactly once: Telegram ignores a second answer to a query.
+        await handle_manual_power(query_id, chat_id, message_id, data == "ctrl:on")
+        return
 
     await tg_answer(query_id)
     if data == "noop":
@@ -842,13 +1048,7 @@ async def handle_callback(query: dict):
             ),
         )
     elif data == "menu:control":
-        label = "🤖 Auto" if _mode == "auto" else "🖐 Manual"
-        await tg_edit(
-            chat_id,
-            message_id,
-            f"🎛 <b>Control</b>\nCurrent mode: <b>{label}</b>",
-            control_kb(),
-        )
+        await tg_edit(chat_id, message_id, control_text(), control_kb())
     elif data == "menu:settings":
         await tg_edit(
             chat_id,
@@ -856,42 +1056,9 @@ async def handle_callback(query: dict):
             settings_text(),
             settings_kb(),
         )
-    elif data == "ctrl:mode:auto":
-        _mode = "auto"
-        log.info("Telegram mode changed to auto")
-        await tg_edit(
-            chat_id,
-            message_id,
-            "🎛 <b>Control</b>\nCurrent mode: <b>🤖 Auto</b>",
-            control_kb(),
-        )
-    elif data == "ctrl:mode:manual":
-        _mode = "manual"
-        log.info("Telegram mode changed to manual")
-        await tg_edit(
-            chat_id,
-            message_id,
-            "🎛 <b>Control</b>\nCurrent mode: <b>🖐 Manual</b>",
-            control_kb(),
-        )
-    elif data == "ctrl:on":
-        await tg_answer(query_id, "Sending ON command...")
-        await set_device_power(True, "Telegram manual")
-        await tg_edit(
-            chat_id,
-            message_id,
-            "🎛 <b>Control</b>\nCurrent mode: <b>🖐 Manual</b>",
-            control_kb(),
-        )
-    elif data == "ctrl:off":
-        await tg_answer(query_id, "Sending OFF command...")
-        await set_device_power(False, "Telegram manual")
-        await tg_edit(
-            chat_id,
-            message_id,
-            "🎛 <b>Control</b>\nCurrent mode: <b>🖐 Manual</b>",
-            control_kb(),
-        )
+    elif data in ("ctrl:mode:auto", "ctrl:mode:manual"):
+        set_mode(data.rsplit(":", 1)[1], "Telegram")
+        await tg_edit(chat_id, message_id, control_text(), control_kb())
     elif data.startswith("set:"):
         _, key, delta_string = data.split(":")
         delta = int(delta_string)
@@ -927,60 +1094,120 @@ async def handle_command(message: dict):
         await tg_send(status_text())
 
 
+def telegram_update_chat_id(update: dict):
+    if "callback_query" in update:
+        message = update["callback_query"].get("message") or {}
+    else:
+        message = update.get("message") or {}
+    return (message.get("chat") or {}).get("id")
+
+
+async def dispatch_telegram_update(update: dict) -> None:
+    if str(telegram_update_chat_id(update)) != TELEGRAM_CHAT_ID.strip():
+        # Only the configured chat may read status or control the device.
+        log.warning("Ignoring Telegram update from an unauthorized chat")
+        return
+    if "callback_query" in update:
+        await handle_callback(update["callback_query"])
+    elif "message" in update:
+        await handle_command(update["message"])
+
+
+def telegram_retry_delay(failures: int, err: BaseException) -> float:
+    retry_after = getattr(err, "retry_after", None)
+    if isinstance(retry_after, (int, float)) and retry_after > 0:
+        return float(retry_after)
+    return min(
+        TELEGRAM_POLL_BASE_BACKOFF * 2 ** (failures - 1),
+        TELEGRAM_POLL_MAX_BACKOFF,
+    )
+
+
 async def telegram_poll():
     offset = 0
+    failures = 0
     log.info("Telegram bot polling started")
     while True:
         try:
-            result = await _tg(
+            result = await _tg_request(
                 "getUpdates",
                 offset=offset,
                 timeout=20,
                 allowed_updates=["message", "callback_query"],
             )
-            for update in result.get("result", []):
-                offset = update["update_id"] + 1
-                if "callback_query" in update:
-                    await handle_callback(update["callback_query"])
-                elif "message" in update:
-                    await handle_command(update["message"])
         except asyncio.CancelledError:
             raise
         except Exception as err:
-            log.warning("Telegram polling error: %s", format_exception(err))
-            await asyncio.sleep(5)
+            # Every failure must back off: a refused connection fails
+            # instantly and would otherwise spin in a tight loop.
+            failures += 1
+            delay = telegram_retry_delay(failures, err)
+            log.log(
+                logging.WARNING if failures == 1 else logging.DEBUG,
+                "Telegram polling failed (failure %d); retrying in %.0fs: %s",
+                failures,
+                delay,
+                format_exception(err),
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        if failures:
+            log.info("Telegram polling recovered after %d failures", failures)
+            failures = 0
+        for update in result.get("result", []):
+            offset = update["update_id"] + 1
+            try:
+                await dispatch_telegram_update(update)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                log.warning(
+                    "Telegram update handling failed: %s",
+                    format_exception(err),
+                )
 
 
 # MQTT
 
-def on_message(client, userdata, message):
-    global _first_data_seen, _mode
-
-    topic = message.topic
-    payload = message.payload.decode("utf-8", errors="replace")
+def handle_mqtt_message(topic: str, payload: str) -> None:
+    """Process one MQTT message on the event-loop thread."""
+    global _first_data_seen
 
     if topic == f"{SENSOR_TOPIC}/json":
         try:
             data = json.loads(payload)
-            _last_sensor.update(data)
-            mark_sensor_online()
-            log.debug(
-                "Sensor: %s°C RH=%s%% Batt=%s%%",
-                data.get("temperature_c"),
-                data.get("humidity"),
-                data.get("battery"),
-            )
-            if not _first_data_seen:
-                _first_data_seen = True
-                log.info("First sensor data received after startup")
-                if TELEGRAM_NOTIFY_SENSOR_ONLINE:
-                    tg_fire(
-                        "✅ <b>Sensor is ONLINE</b>" + sensor_summary(),
-                        cooldown_key="sensor_online",
-                    )
-            evaluate_auto(data)
         except json.JSONDecodeError:
             log.warning("Bad sensor JSON: %s", payload)
+            return
+        if not isinstance(data, dict):
+            log.warning("Ignoring non-object sensor JSON")
+            return
+        _last_sensor.update(data)
+        if not sensor_reading_is_fresh(data):
+            # Typically the broker's retained message from a scanner that is
+            # no longer publishing. Show it, but never act on it.
+            log.info(
+                "Ignoring sensor reading from %ds ago for control",
+                int(sensor_reading_age(data)),
+            )
+            return
+        mark_sensor_online()
+        log.debug(
+            "Sensor: %s°C RH=%s%% Batt=%s%%",
+            data.get("temperature_c"),
+            data.get("humidity"),
+            data.get("battery"),
+        )
+        if not _first_data_seen:
+            _first_data_seen = True
+            log.info("First sensor data received after startup")
+            if TELEGRAM_NOTIFY_SENSOR_ONLINE:
+                tg_fire(
+                    "✅ <b>Sensor is ONLINE</b>" + sensor_summary(),
+                    cooldown_key="sensor_online",
+                )
+        evaluate_auto(data)
     elif topic == f"{SENSOR_TOPIC}/status":
         if payload == "offline":
             schedule_sensor_offline_confirmation()
@@ -992,23 +1219,41 @@ def on_message(client, userdata, message):
                     cooldown_key="sensor_online",
                 )
     elif topic == f"{CONTROL_TOPIC}/mode":
-        if payload in ("auto", "manual"):
-            _mode = payload
-            log.info("Mode set to %s", _mode)
+        set_mode(payload, "MQTT")
     elif topic == f"{CONTROL_TOPIC}/command":
         if _mode != "manual":
             log.warning("Ignoring command %r because mode is not manual", payload)
             return
-        if payload == "on":
-            asyncio.run_coroutine_threadsafe(
-                set_device_power(True, "MQTT command"),
-                _loop,
-            )
-        elif payload == "off":
-            asyncio.run_coroutine_threadsafe(
-                set_device_power(False, "MQTT command"),
-                _loop,
-            )
+        if payload in ("on", "off"):
+            spawn(set_device_power(payload == "on", "MQTT command", force=True))
+
+
+def _handle_mqtt_message_safely(topic: str, payload: str) -> None:
+    try:
+        handle_mqtt_message(topic, payload)
+    except Exception:
+        log.exception("MQTT message handling failed for %s", topic)
+
+
+def on_message(client, userdata, message):
+    """Runs on paho's network thread: hand the message to the event loop.
+
+    All controller state is owned by the event-loop thread, so no state is
+    read or written here.
+    """
+    loop = _loop
+    if loop is None or loop.is_closed():
+        return
+    payload = message.payload.decode("utf-8", errors="replace")
+    try:
+        loop.call_soon_threadsafe(
+            _handle_mqtt_message_safely,
+            message.topic,
+            payload,
+        )
+    except RuntimeError:
+        # The loop closed between the check and the call during shutdown.
+        pass
 
 
 def setup_mqtt() -> mqtt.Client:
@@ -1037,9 +1282,10 @@ async def main():
 
     log.info("Starting SwitchBot to ConnectLife controller")
     log.info(
-        "Thresholds: ON >= %d%% OFF <= %d%%",
+        "Thresholds: ON >= %d%% OFF <= %d%%; mode=%s",
         _settings["humidity_on_above"],
         _settings["humidity_off_below"],
+        _mode,
     )
 
     api_ok = await connectlife_login()
@@ -1064,11 +1310,13 @@ async def main():
     try:
         await stop.wait()
     finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
         client.loop_stop()
         client.disconnect()
+        pending = [*tasks, *_background_tasks]
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        await close_telegram_session()
         if _cl_api:
             await _cl_api.close()
         log.info("Stopped")

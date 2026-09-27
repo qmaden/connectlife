@@ -75,11 +75,18 @@ Preserve these automation contracts:
 - After the target appliance has been discovered and cached, keep safety writes
   independent of fresh reads and keep network reads outside the command lock.
   Do not claim writes can bypass initial appliance discovery.
-- Discard refresh results superseded by a successful command.
+- Discard refresh results superseded by a successful command, and ignore
+  reads contradicting a successful command within
+  `CONNECTLIFE_COMMAND_SETTLE_SECONDS`.
+- Keep all controller state on the event-loop thread; MQTT callbacks only
+  schedule work with `call_soon_threadsafe`.
+- Ignore sensor readings older than `SENSOR_MAX_AGE_SECONDS` for control.
 - Keep ON/OFF writes idempotent and preserve the configured hysteresis.
-- Preserve atomic settings writes and the sensor-offline confirmation window.
-- Keep Telegram secrets redacted, avoid identifiers in new logs, and preserve
-  the existing notification cooldown behavior.
+- Preserve atomic settings writes (thresholds and mode), the sensor-offline
+  confirmation window, and the opt-in offline failsafe.
+- Keep Telegram secrets redacted, avoid identifiers in new logs, preserve the
+  existing notification cooldown behavior, accept updates only from
+  `TELEGRAM_CHAT_ID`, and back off on every polling failure.
 
 Add focused tests in `capture/tests/test_switchbot_control.py` for state,
 concurrency, selection, notification, and retry changes. Mock MQTT, Telegram,
@@ -139,6 +146,8 @@ Deploy only when the user authorizes production changes.
    sensor data without logging secrets.
 7. Monitor at least two state-refresh intervals (default 60 seconds each) for
    retries, unknown state, authentication failures, or restarts.
+   `capture/restart_services.sh` performs steps 4-7 for both units; run it
+   only when both services are affected and the user authorized the restart.
 8. Report the deployed commit, tests, service state, and any branch not yet
    pushed to the GitHub fork.
 

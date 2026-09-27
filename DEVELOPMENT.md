@@ -8,17 +8,12 @@ the virtual environment.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e .
+python -m pip install -e ".[controller]"
 ```
 
-The production programs and full test suite also import `paho-mqtt` and
-`bleak`. They are installed in the deployed environment but are not currently
-declared as library dependencies. Install them explicitly before developing or
-validating the BLE/MQTT services:
-
-```bash
-python -m pip install paho-mqtt bleak
-```
+The `controller` extra installs `paho-mqtt` and `bleak`, which the production
+BLE/MQTT programs and the full test suite import. A library-only install
+(`python -m pip install -e .`) omits them.
 
 ## Validation
 

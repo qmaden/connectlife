@@ -35,20 +35,27 @@ LOG_FILE = os.path.join(
 )
 log = logging.getLogger("switchbot-mqtt")
 if not log.handlers:
-    file_handler = logging.handlers.RotatingFileHandler(
-        LOG_FILE,
-        maxBytes=5 * 1024 * 1024,
-        backupCount=3,
-    )
-    stream_handler = logging.StreamHandler()
+    # Under systemd, stdout already goes to the persistent journal with
+    # timestamps. Writing a rotating file as well would store every line twice.
+    under_journal = bool(os.environ.get("JOURNAL_STREAM"))
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if not under_journal:
+        handlers.append(
+            logging.handlers.RotatingFileHandler(
+                LOG_FILE,
+                maxBytes=5 * 1024 * 1024,
+                backupCount=3,
+            )
+        )
     formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s",
+        "[%(levelname)s] %(message)s"
+        if under_journal
+        else "%(asctime)s [%(levelname)s] %(message)s",
         "%Y-%m-%d %H:%M:%S",
     )
-    file_handler.setFormatter(formatter)
-    stream_handler.setFormatter(formatter)
-    log.addHandler(file_handler)
-    log.addHandler(stream_handler)
+    for handler in handlers:
+        handler.setFormatter(formatter)
+        log.addHandler(handler)
 log.setLevel(logging.INFO)
 log.propagate = False
 

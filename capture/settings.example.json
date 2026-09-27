@@ -1,4 +1,5 @@
 {
   "humidity_on_above": 60,
-  "humidity_off_below": 55
+  "humidity_off_below": 55,
+  "mode": "auto"
 }

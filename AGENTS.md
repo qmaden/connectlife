@@ -23,7 +23,11 @@ deployment work, also load
   property updates.
 - `connectlife/tests/`: API, signing, retry, appliance, and local integration
   tests.
-- `capture/switchbot_mqtt.py`: production BLE scanner and MQTT publisher.
+- `capture/switchbot_mqtt.py`: production BLE scanner and MQTT publisher. The
+  sensor is indoors; the `switchbot/outdoor` topic and "Outdoor" labels are
+  historical names only.
+- `capture/restart_services.sh`: host-side check, restart, and verification of
+  both services.
 - `capture/switchbot_control.py`: production MQTT consumer, hysteresis,
   ConnectLife control, reconciliation, and Telegram UI.
 - `capture/tests/`: controller state and concurrency regression tests.
@@ -41,10 +45,8 @@ deployment work, also load
 - Prefer `.venv/` for local work. The deployed checkout uses `venv/`.
 - Install the library in editable mode for development: `python -m pip install
   -e .`.
-- The production `capture/` programs also import `paho-mqtt` and `bleak`. These
-  runtime dependencies are currently installed on the server but are not yet
-  declared in `pyproject.toml`; do not assume a clean library install provides
-  them.
+- The production `capture/` programs also import `paho-mqtt` and `bleak`,
+  declared as the `controller` extra: `python -m pip install -e ".[controller]"`.
 
 ## Non-negotiable invariants
 
@@ -82,11 +84,17 @@ deployment work, also load
   Do not make a safety command wait for a background refresh. A startup outage
   can still block writes until initial appliance discovery succeeds.
 - Do not hold the command lock during a network read. Discard slow refresh
-  results that were superseded by a successful command.
+  results that were superseded by a successful command, and ignore reads that
+  contradict a successful command within the settle window.
+- Own all controller state on the event-loop thread. MQTT callbacks only hand
+  messages to the loop.
+- Never act on sensor readings older than `SENSOR_MAX_AGE_SECONDS`.
+- Accept Telegram updates only from `TELEGRAM_CHAT_ID`, and back off on every
+  Telegram polling failure.
 - Preserve hysteresis: ON at or above the configured upper threshold, OFF at or
   below the lower threshold, and always require the lower threshold to be less
   than the upper threshold.
-- Write controller settings atomically.
+- Write controller settings, including the persisted mode, atomically.
 
 ### Live-system safety
 
