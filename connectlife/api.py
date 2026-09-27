@@ -540,12 +540,12 @@ class ConnectLifeApi:
             elif self._expires < dt.datetime.now(dt.UTC):
                 try:
                     await self._refresh_access_token()
-                except (
-                    LifeConnectAuthError,
-                    aiohttp.ClientError,
-                    asyncio.TimeoutError,
-                    ValueError,
-                ) as err:
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    # A transport failure says nothing about the refresh
+                    # token. Keep it so the next attempt can refresh instead
+                    # of repeating the full Gigya/JWT/OAuth login.
+                    raise
+                except (LifeConnectAuthError, ValueError) as err:
                     _LOGGER.warning(
                         "ConnectLife token refresh failed; retrying full login: %s",
                         self._format_request_error(err),
@@ -705,7 +705,7 @@ class ConnectLifeApi:
                 _LOGGER.debug(response.headers)
                 _LOGGER.debug(await response.text())
                 raise LifeConnectAuthError(f"Unexpected response from refreshing access token: status={response.status}")
-            body = await response.json()
+            body = await self._json(response)
             self._access_token = self._require_auth_field(body, "access_token")
             expires_in = self._require_auth_field(body, "expires_in")
             # Renew 90 seconds before expiration

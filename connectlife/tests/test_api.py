@@ -269,6 +269,21 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         api._refresh_access_token.assert_awaited_once()
         api._initial_access_token.assert_awaited_once()
 
+    async def test_transport_error_during_refresh_keeps_refresh_token(self):
+        api = self.make_api()
+        api._expires = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
+        api._refresh_access_token = AsyncMock(
+            side_effect=aiohttp.ClientConnectionError("network down")
+        )
+        api._initial_access_token = AsyncMock()
+
+        with self.assertRaises(aiohttp.ClientConnectionError):
+            await api._fetch_access_token()
+
+        api._initial_access_token.assert_not_awaited()
+        self.assertEqual("refresh", api._refresh_token)
+        self.assertIsNotNone(api._expires)
+
 
 if __name__ == "__main__":
     unittest.main()
